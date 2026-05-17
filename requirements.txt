@@ -1,0 +1,8 @@
+pyrogram==2.0.106
+TgCrypto
+py-tgcalls>=0.9.30
+yt-dlp
+spotipy
+python-dotenv
+aiofiles
+pillow
