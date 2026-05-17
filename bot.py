@@ -1,28 +1,28 @@
 """
 Telegram Voice Chat Music & Video Streaming Bot
 ================================================
-Supports: YouTube, Spotify, Direct links, Local files
-Requirements: See requirements.txt
+Compatible with: py-tgcalls 2.x, pyrogram 2.x
+Supports: YouTube, Spotify, Direct links, File uploads
 """
 
 import asyncio
 import os
 import re
-import time
 from typing import Optional
 
 from pyrogram import Client, filters
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 )
-from pyrogram.errors import UserNotParticipant
 from pytgcalls import PyTgCalls, idle
 from pytgcalls.types import (
-    AudioPiped, AudioImagePiped, VideoPiped,
-    HighQualityAudio, HighQualityVideo, MediumQualityAudio, MediumQualityVideo
+    MediaStream,
+    AudioQuality,
+    VideoQuality,
 )
 from pytgcalls.exceptions import (
-    GroupCallNotFound, NoActiveGroupCall, AlreadyJoinedError
+    NoActiveGroupCall,
+    AlreadyJoinedError,
 )
 
 import yt_dlp
@@ -32,10 +32,10 @@ from spotipy.oauth2 import SpotifyClientCredentials
 from config import Config
 from database import db
 from utils import (
-    get_youtube_info, get_spotify_track, format_duration,
-    thumbnail_gen, is_url, get_file_info
+    get_youtube_info, get_spotify_track, format_duration, is_url, get_file_info
 )
 from queue_manager import QueueManager
+
 
 # ─── Initialize Clients ────────────────────────────────────────────────────────
 
@@ -48,6 +48,7 @@ app = Client(
 
 call_py = PyTgCalls(app)
 queues = QueueManager()
+
 
 # ─── Spotify Setup ─────────────────────────────────────────────────────────────
 
@@ -64,18 +65,33 @@ else:
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
+def make_stream(track: dict) -> MediaStream:
+    if track["type"] == "video":
+        return MediaStream(
+            track["stream_url"],
+            audio_quality=AudioQuality.HIGH,
+            video_quality=VideoQuality.HD_720p,
+        )
+    else:
+        return MediaStream(
+            track["stream_url"],
+            audio_quality=AudioQuality.HIGH,
+            video_quality=VideoQuality.NO_VIDEO,
+        )
+
+
 def build_controls(chat_id: int) -> InlineKeyboardMarkup:
     queue_len = len(queues.get_queue(chat_id))
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("⏸ Pause",    callback_data="pause"),
-            InlineKeyboardButton("▶️ Resume",   callback_data="resume"),
-            InlineKeyboardButton("⏭ Skip",     callback_data="skip"),
+            InlineKeyboardButton("⏸ Pause",   callback_data="pause"),
+            InlineKeyboardButton("▶️ Resume",  callback_data="resume"),
+            InlineKeyboardButton("⏭ Skip",    callback_data="skip"),
         ],
         [
-            InlineKeyboardButton("🔀 Shuffle",  callback_data="shuffle"),
-            InlineKeyboardButton("🔁 Loop",     callback_data="loop"),
-            InlineKeyboardButton("⏹ Stop",     callback_data="stop"),
+            InlineKeyboardButton("🔀 Shuffle", callback_data="shuffle"),
+            InlineKeyboardButton("🔁 Loop",    callback_data="loop"),
+            InlineKeyboardButton("⏹ Stop",    callback_data="stop"),
         ],
         [
             InlineKeyboardButton(f"📋 Queue ({queue_len})", callback_data="queue"),
@@ -85,33 +101,18 @@ def build_controls(chat_id: int) -> InlineKeyboardMarkup:
 
 
 async def stream_next(chat_id: int):
-    """Play next track in queue."""
     track = queues.pop(chat_id)
     if not track:
-        await call_py.leave_group_call(chat_id)
+        try:
+            await call_py.leave_group_call(chat_id)
+        except Exception:
+            pass
         return
-
     try:
-        if track["type"] == "video":
-            await call_py.change_stream(
-                chat_id,
-                AudioImagePiped(
-                    track["stream_url"],
-                    track.get("thumbnail", ""),
-                    audio_parameters=HighQualityAudio(),
-                )
-            )
-        else:
-            await call_py.change_stream(
-                chat_id,
-                AudioPiped(
-                    track["stream_url"],
-                    audio_parameters=HighQualityAudio(),
-                )
-            )
+        await call_py.change_stream(chat_id, make_stream(track))
         await db.set_current(chat_id, track)
     except Exception as e:
-        print(f"Stream error: {e}")
+        print(f"[stream_next error] {e}")
         await stream_next(chat_id)
 
 
@@ -135,9 +136,6 @@ async def start_cmd(_, msg: Message):
         "• `/seek <seconds>` — Seek in track\n"
         "• `/now` — Now playing\n\n"
         "**Supports:** YouTube · Spotify · Direct URLs · File uploads",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("➕ Add to Group", url=f"https://t.me/{(await app.get_me()).username}?startgroup=true"),
-        ]])
     )
 
 
@@ -153,44 +151,36 @@ async def vplay_cmd(_, msg: Message):
 
 async def _play(msg: Message, video: bool = False):
     chat_id = msg.chat.id
-    query = " ".join(msg.command[1:]).strip()
 
-    # Handle file uploads
-    if msg.reply_to_message and (
-        msg.reply_to_message.audio or
-        msg.reply_to_message.video or
-        msg.reply_to_message.voice or
-        msg.reply_to_message.document
-    ):
+    reply = msg.reply_to_message
+    if reply and (reply.audio or reply.video or reply.voice or reply.document):
         status = await msg.reply_text("📥 **Downloading file...**")
         try:
-            path = await msg.reply_to_message.download()
+            path = await reply.download()
             info = await get_file_info(path)
             track = {
                 "title": info["title"],
                 "duration": info["duration"],
                 "stream_url": path,
-                "thumbnail": info.get("thumbnail", ""),
+                "thumbnail": "",
                 "type": "video" if video else "audio",
                 "requester": msg.from_user.mention if msg.from_user else "Unknown",
-                "is_file": True,
             }
             await _enqueue_and_play(msg, chat_id, track, status)
-            return
         except Exception as e:
             await status.edit_text(f"❌ Error: `{e}`")
-            return
+        return
 
+    query = " ".join(msg.command[1:]).strip()
     if not query:
-        await msg.reply_text("❗ Please provide a song name, YouTube/Spotify URL, or direct link.")
+        await msg.reply_text("❗ Please provide a song name or URL.")
         return
 
     status = await msg.reply_text("🔍 **Searching...**")
-
     try:
         track = await resolve_track(query, video=video, msg=msg)
         if not track:
-            await status.edit_text("❌ Could not find or process the requested track.")
+            await status.edit_text("❌ Could not find the requested track.")
             return
         await _enqueue_and_play(msg, chat_id, track, status)
     except Exception as e:
@@ -198,17 +188,12 @@ async def _play(msg: Message, video: bool = False):
 
 
 async def resolve_track(query: str, video: bool, msg: Message) -> Optional[dict]:
-    """Resolve a query/URL to a streamable track dict."""
-
-    # ── Spotify ──────────────────────────────────────────────────
     if "spotify.com/track" in query:
         if not sp:
-            raise RuntimeError("Spotify credentials not configured.")
+            raise RuntimeError("Spotify credentials not set in .env")
         info = await get_spotify_track(sp, query)
-        # Spotify doesn't allow direct streaming; search YouTube for the track
         query = f"{info['name']} {info['artists']} official audio"
 
-    # ── YouTube / general URL / search ───────────────────────────
     info = await get_youtube_info(query, video=video)
     if not info:
         return None
@@ -221,7 +206,6 @@ async def resolve_track(query: str, video: bool, msg: Message) -> Optional[dict]
         "webpage_url": info.get("webpage_url", ""),
         "type": "video" if video else "audio",
         "requester": msg.from_user.mention if msg.from_user else "Unknown",
-        "is_file": False,
     }
 
 
@@ -235,33 +219,23 @@ async def _enqueue_and_play(msg: Message, chat_id: int, track: dict, status: Mes
             f"📋 **Added to Queue** `#{pos}`\n\n"
             f"🎵 **{track['title']}**\n"
             f"⏱ Duration: `{format_duration(track['duration'])}`\n"
-            f"👤 Requested by: {track['requester']}",
+            f"👤 Requested by: {track['requester']}"
         )
         return
 
-    # Nothing playing — start now
-    await status.edit_text("⏳ **Connecting...**")
+    await status.edit_text("⏳ **Connecting to voice chat...**")
+
     try:
-        stream = (
-            AudioImagePiped(
-                track["stream_url"],
-                track.get("thumbnail", ""),
-                audio_parameters=HighQualityAudio(),
-            ) if track["type"] == "video"
-            else AudioPiped(
-                track["stream_url"],
-                audio_parameters=HighQualityAudio(),
-            )
-        )
+        stream = make_stream(track)
+
         try:
-            await call_py.join_group_call(chat_id, stream, stream_type=track["type"])
+            await call_py.join_group_call(chat_id, stream)
         except AlreadyJoinedError:
             await call_py.change_stream(chat_id, stream)
 
+        queues.pop(chat_id)
         await db.set_current(chat_id, track)
-        queues.pop(chat_id)  # Remove from queue since it's now playing
 
-        thumb = track.get("thumbnail") or ""
         caption = (
             f"🎵 **Now Playing**\n\n"
             f"**{track['title']}**\n"
@@ -269,6 +243,7 @@ async def _enqueue_and_play(msg: Message, chat_id: int, track: dict, status: Mes
             f"👤 Requested by: {track['requester']}"
         )
 
+        thumb = track.get("thumbnail", "")
         try:
             if thumb:
                 await status.delete()
@@ -279,7 +254,11 @@ async def _enqueue_and_play(msg: Message, chat_id: int, track: dict, status: Mes
             await status.edit_text(caption, reply_markup=build_controls(chat_id))
 
     except NoActiveGroupCall:
-        await status.edit_text("❌ No active voice chat. Start one first with the video camera button.")
+        await status.edit_text(
+            "❌ **No active voice chat found!**\n"
+            "Start a Voice Chat in the group first, then use /play again."
+        )
+        queues.clear(chat_id)
     except Exception as e:
         await status.edit_text(f"❌ Playback error: `{e}`")
         await db.del_current(chat_id)
@@ -334,18 +313,17 @@ async def queue_cmd(_, msg: Message):
         await msg.reply_text("📋 Queue is empty.")
         return
 
-    text = "🎵 **Now Playing:**\n"
+    text = ""
     if current:
-        text += f"➤ **{current['title']}** [`{format_duration(current['duration'])}`]\n\n"
-
+        text += f"🎵 **Now Playing:**\n➤ **{current['title']}** `[{format_duration(current['duration'])}]`\n\n"
     if q:
         text += "📋 **Up Next:**\n"
         for i, t in enumerate(q[:10], 1):
-            text += f"`{i}.` {t['title']} [`{format_duration(t['duration'])}`]\n"
+            text += f"`{i}.` {t['title']} `[{format_duration(t['duration'])}]`\n"
         if len(q) > 10:
-            text += f"\n...and **{len(q)-10}** more."
+            text += f"\n...and **{len(q) - 10}** more tracks."
     else:
-        text += "📋 Queue is empty after this track."
+        text += "📋 No more tracks in queue."
 
     await msg.reply_text(text)
 
@@ -366,9 +344,8 @@ async def volume_cmd(_, msg: Message):
 
 @app.on_message(filters.command("loop") & filters.group)
 async def loop_cmd(_, msg: Message):
-    chat_id = msg.chat.id
-    state = await db.toggle_loop(chat_id)
-    await msg.reply_text(f"🔁 Loop mode **{'ON' if state else 'OFF'}**")
+    state = await db.toggle_loop(msg.chat.id)
+    await msg.reply_text(f"🔁 Loop mode **{'ON ✅' if state else 'OFF ❌'}**")
 
 
 @app.on_message(filters.command("shuffle") & filters.group)
@@ -395,13 +372,13 @@ async def now_cmd(_, msg: Message):
     if not current:
         await msg.reply_text("🔇 Nothing is playing right now.")
         return
-    text = (
+    await msg.reply_text(
         f"🎵 **Now Playing**\n\n"
         f"**{current['title']}**\n"
         f"⏱ Duration: `{format_duration(current['duration'])}`\n"
-        f"👤 Requested by: {current['requester']}"
+        f"👤 Requested by: {current['requester']}",
+        reply_markup=build_controls(msg.chat.id),
     )
-    await msg.reply_text(text, reply_markup=build_controls(msg.chat.id))
 
 
 # ─── Callback Handlers ─────────────────────────────────────────────────────────
@@ -425,7 +402,10 @@ async def cb_handler(_, cq: CallbackQuery):
         elif data == "stop":
             queues.clear(chat_id)
             await db.del_current(chat_id)
-            await call_py.leave_group_call(chat_id)
+            try:
+                await call_py.leave_group_call(chat_id)
+            except Exception:
+                pass
             await cq.answer("⏹ Stopped")
             await cq.message.edit_text("⏹ **Playback stopped.**")
             return
@@ -440,16 +420,17 @@ async def cb_handler(_, cq: CallbackQuery):
             current = await db.get_current(chat_id)
             lines = []
             if current:
-                lines.append(f"➤ **{current['title']}**")
+                lines.append(f"➤ {current['title']}")
             for i, t in enumerate(q[:5], 1):
-                lines.append(f"`{i}.` {t['title']}")
+                lines.append(f"{i}. {t['title']}")
             await cq.answer("\n".join(lines) if lines else "Queue empty", show_alert=True)
             return
         elif data == "volume":
-            await cq.answer("Use /volume 1-200", show_alert=True)
+            await cq.answer("Use /volume 1-200 in chat", show_alert=True)
             return
 
         await cq.message.edit_reply_markup(build_controls(chat_id))
+
     except Exception as e:
         await cq.answer(f"Error: {e}", show_alert=True)
 
@@ -457,11 +438,11 @@ async def cb_handler(_, cq: CallbackQuery):
 # ─── Stream End Handler ────────────────────────────────────────────────────────
 
 @call_py.on_stream_end()
-async def stream_end_handler(_, update):
+async def on_stream_end(_, update):
     chat_id = update.chat_id
-    loop = await db.get_loop(chat_id)
+    loop_on = await db.get_loop(chat_id)
 
-    if loop:
+    if loop_on:
         current = await db.get_current(chat_id)
         if current:
             queues.add_front(chat_id, current)
@@ -475,7 +456,7 @@ async def stream_end_handler(_, update):
 async def main():
     await app.start()
     await call_py.start()
-    print("✅ MusicBot is running!")
+    print("✅ MusicBot is running! Press Ctrl+C to stop.")
     await idle()
     await app.stop()
 
