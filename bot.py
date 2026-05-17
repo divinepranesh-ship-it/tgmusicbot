@@ -24,8 +24,8 @@ from pytgcalls.types import (
 )
 from pytgcalls.exceptions import NoActiveGroupCall
 
-import spotify
-from spotify.oauth2 import SpotifyClientCredentials
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
 
 from config import Config
 from database import db
